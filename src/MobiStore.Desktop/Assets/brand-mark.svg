@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 64 64" role="img" aria-label="Mobi Store">
+ <rect width="64" height="64" rx="16" fill="#0ea68d"/>
+ <rect x="18" y="9" width="28" height="46" rx="5" fill="none" stroke="#80f4dd" stroke-width="2"/>
+ <path fill="#0ea68d" d="M11 19h42v27H11z"/>
+ <path fill="#fff" d="M12 44V22h8l12 13 12-13h8v22h-8V34L32 47 20 34v10zM28 50h8v2h-8z"/>
+</svg>

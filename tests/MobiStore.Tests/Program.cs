@@ -1,0 +1,213 @@
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text.Json;
+using MobiStore.Core;
+
+var passed = 0;
+void Check(bool condition, string name) { if (!condition) throw new Exception("FAIL: " + name); passed++; Console.WriteLine("PASS: " + name); }
+void Reject(Action action, string name) { try { action(); } catch (RuleException) { Check(true, name); return; } throw new Exception("FAIL: " + name); }
+Check(Rules.ToBase(150000, "SYP", 15000, "USD") == 10, "SYP collection converts using transaction rate");
+Check(Rules.ToBase(10, "USD", 15000, "SYP") == 150000, "SYP base supported");
+Check(Rules.ToBase(10, "USD", 15000, "USD") == 10, "Same currency unchanged");
+Check(Rules.UnitQuantity(3, 12) == 36, "Box converts to pieces");
+Check(Rules.LineTotal(3, 10, 5) == 25, "Line discount applied once");
+Check(Rules.Round(1.12345m) == 1.1235m, "Deterministic four-place rounding");
+Reject(() => Rules.ToBase(1, "SYP", 0, "USD"), "Zero exchange rate rejected");
+Reject(() => Rules.ToBase(1, "EUR", 1, "USD"), "Unsupported currency rejected");
+Reject(() => Rules.UnitQuantity(-1, 12), "Negative quantity rejected");
+Reject(() => Rules.LineTotal(1, 5, 6), "Excess line discount rejected");
+Reject(() => Rules.UnitQuantity(0.00001m, 1), "Sub-precision quantity rejected before SQL rounding");
+Reject(() => Rules.Balanced([(1m, 0m), (0m, 0.9999m)]), "Unbalanced journal rejected");
+Rules.Balanced([(10m, 0m), (0m, 10m)]); Check(true, "Balanced journal accepted");
+if (args.Length == 0) { Console.WriteLine($"{passed} core checks passed"); return; }
+
+using var client = new HttpClient { BaseAddress = new Uri(args[0]) };
+async Task<T> Get<T>(string path)
+{
+    using var response = await client.GetAsync(path);
+    if (!response.IsSuccessStatusCode) throw new Exception($"GET {path}: {response.StatusCode} {await response.Content.ReadAsStringAsync()}");
+    return (await response.Content.ReadFromJsonAsync<T>())!;
+}
+async Task<T> Post<T>(string path, object input)
+{
+    using var response = await client.PostAsJsonAsync(path, input);
+    if (!response.IsSuccessStatusCode) throw new Exception($"POST {path}: {response.StatusCode} {await response.Content.ReadAsStringAsync()}");
+    if (response.StatusCode == HttpStatusCode.NoContent) return default!;
+    return (await response.Content.ReadFromJsonAsync<T>())!;
+}
+async Task Bad(string path, object input, HttpStatusCode code, string name)
+{ using var response = await client.PostAsJsonAsync(path, input); Check(response.StatusCode == code, name + $" ({response.StatusCode})"); }
+
+Check((await client.GetAsync("api/products")).StatusCode == HttpStatusCode.Unauthorized, "Anonymous catalog rejected");
+var password = "TestOnly!" + Guid.NewGuid().ToString("N");
+await Post<JsonElement>("api/setup", new SetupRequest("متجر اختبار مستقل", "USD", "testadmin", "مدير اختبار", password));
+await Bad("api/setup", new SetupRequest("other", "SYP", "another", "Other", password), HttpStatusCode.BadRequest, "Base currency setup immutable");
+var admin = await Post<LoginResponse>("api/login", new LoginRequest("testadmin", password));
+client.DefaultRequestHeaders.Authorization = new("Bearer", admin.Token);
+var catalog = await Get<JsonElement[]>("api/databases");
+Check(catalog.Length == 1, "Database list includes configured database");
+await Bad("api/databases/create", new { name = "Golden_Existing", title = "Rejected" }, HttpStatusCode.BadRequest, "Foreign database names rejected");
+var secondDatabase = "MobiStore_Isolation_" + Guid.NewGuid().ToString("N");
+await Post<JsonElement>("api/databases/create", new { name = secondDatabase, title = "قاعدة اختبار العزل" });
+await Bad("api/databases/create", new { name = secondDatabase, title = "Duplicate" }, HttpStatusCode.BadRequest, "Existing database never overwritten");
+client.DefaultRequestHeaders.Add("X-MobiStore-Database", secondDatabase);
+Check(!(await Get<SetupStatus>("api/setup")).Installed, "New database starts without company or users");
+Check((await client.GetAsync("api/products")).StatusCode == HttpStatusCode.Unauthorized, "Session token cannot cross database boundary");
+await Post<JsonElement>("api/setup", new SetupRequest("قاعدة ثانية", "SYP", "secondadmin", "مدير ثان", password));
+Check((await Get<SetupStatus>("api/setup")).BaseCurrency == "SYP", "Each database keeps independent base currency");
+client.DefaultRequestHeaders.Remove("X-MobiStore-Database");
+Check((await Get<SetupStatus>("api/setup")).BaseCurrency == "USD", "Switching back preserves original company currency");
+client.DefaultRequestHeaders.Add("X-MobiStore-Database", "MobiStore_Unregistered");
+Check((await client.GetAsync("api/setup")).StatusCode == HttpStatusCode.BadRequest, "Unregistered database header rejected");
+client.DefaultRequestHeaders.Remove("X-MobiStore-Database");
+var warehouse = (await Get<List<WarehouseView>>("api/warehouses")).Single();
+await Post<JsonElement>("api/products", new ProductInput("P001", "شاحن اختبار", "TEST-001", "قطعة", 1, 10, 9));
+var product = (await Get<List<ProductView>>("api/products")).Single(); var unit = product.Units.Single();
+await Post<JsonElement>($"api/products/{product.Id}/units", new UnitView(Guid.Empty, "علبة", "TEST-BOX", 12));
+await Post<JsonElement>("api/customers", new CustomerInput("عميل اختبار", "", 100, 30, false));
+var customer = (await Get<List<CustomerView>>("api/customers")).Single(x => x.Name == "عميل اختبار");
+var purchase = new PurchaseRequest(Guid.NewGuid(), warehouse.Id, "مورد اختبار", "USD", 15000, [new(unit.Id, 10, 5)]);
+await Post<OperationResult>("api/purchases", purchase); await Post<OperationResult>("api/purchases", purchase);
+Check((await Get<List<ProductView>>("api/products")).Single().Stock == 10, "Purchase retry does not double inventory");
+var userPassword = "Cashier!" + Guid.NewGuid().ToString("N");
+await Post<JsonElement>("api/users", new UserInput("cashier1", "موظف اختبار", userPassword, false, [Access.Sale, Access.Credit], 0));
+var cashier = await Post<LoginResponse>("api/login", new LoginRequest("cashier1", userPassword));
+client.DefaultRequestHeaders.Authorization = new("Bearer", cashier.Token);
+Check((await Get<List<ProductView>>("api/products")).Single().Cost is null, "Cashier cannot read cost through API");
+Check((await Get<List<CustomerView>>("api/customers")).All(x => x.Balance is null), "Cashier cannot read customer balances without permission");
+var shift = new OpenSessionRequest(Guid.NewGuid()); await Post<OperationResult>("api/sessions/open", shift);
+var sale = new SaleRequest(Guid.NewGuid(), shift.RequestId, warehouse.Id, customer.Id, "USD", 15000, 5, "USD", 15000, DateOnly.FromDateTime(DateTime.Today), [new(unit.Id, 2, 10, 0)]);
+await Post<OperationResult>("api/sales", sale); await Post<OperationResult>("api/sales", sale);
+Check((await Get<List<ProductView>>("api/products")).Single().Stock == 8, "Sale retry cannot double-decrement stock");
+await Bad("api/sales", sale with { CashPaid = 6 }, HttpStatusCode.BadRequest, "Changed retry payload rejected");
+await Bad("api/sales", sale with { RequestId = Guid.NewGuid(), Lines = [new(unit.Id, 20, 10, 0)] }, HttpStatusCode.BadRequest, "Oversell rejected atomically");
+await Bad("api/sales", sale with { RequestId = Guid.NewGuid(), Lines = [new(unit.Id, 1, 10, 1)] }, HttpStatusCode.BadRequest, "Unauthorized discount rejected on server");
+Check((await Get<List<ProductView>>("api/products")).Single().Stock == 8, "Rejected transactions leave inventory intact");
+await Bad("api/receipts", new ReceiptRequest(Guid.NewGuid(), shift.RequestId, customer.Id, "USD", 1, 15000, ""), HttpStatusCode.Forbidden, "Employee cannot collect customer payment");
+client.DefaultRequestHeaders.Authorization = new("Bearer", admin.Token);
+Check((await Get<List<CustomerView>>("api/customers")).Single(x => x.Id == customer.Id).Balance == 15, "Credit sale has correct debt after cash payment");
+var adminShift = new OpenSessionRequest(Guid.NewGuid()); await Post<OperationResult>("api/sessions/open", adminShift);
+var receipt = new ReceiptRequest(Guid.NewGuid(), adminShift.RequestId, customer.Id, "SYP", 150000, 15000, "تحصيل اختبار");
+await Post<OperationResult>("api/receipts", receipt); await Post<OperationResult>("api/receipts", receipt);
+Check((await Get<List<CustomerView>>("api/customers")).Single(x => x.Id == customer.Id).Balance == 5, "Manager SYP collection updates USD debt exactly once");
+Check((await Get<List<DueView>>("api/due")).Single().Remaining == 5, "Due alert follows receipt allocation");
+var detail = await Get<JsonElement>($"api/invoices/{sale.RequestId}"); var lineId = detail.GetProperty("lines")[0].GetProperty("id").GetGuid();
+await Post<OperationResult>("api/returns", new ReturnRequest(Guid.NewGuid(), sale.RequestId, [new(lineId, 1)]));
+Check((await Get<List<ProductView>>("api/products")).Single().Stock == 9, "Return restores inventory");
+Check((await Get<List<CustomerView>>("api/customers")).Single(x => x.Id == customer.Id).Balance == -5, "Return creates explicit customer credit without cash payout");
+Check((await Get<JsonElement>($"api/receipts/{receipt.RequestId}")).GetProperty("balance").GetDecimal() == 5, "Receipt retains historical balance after later return");
+var cashierClose = new CloseRequest(Guid.NewGuid(), shift.RequestId, [new("USD", 4), new("SYP", 0)]);
+await Bad("api/sessions/close", cashierClose, HttpStatusCode.BadRequest, "Incorrect cash count rejected without closing");
+Check((await Get<List<SessionView>>("api/sessions")).Count == 2, "Rejected close leaves both sessions open");
+cashierClose = cashierClose with { Counts = [new("USD", 5), new("SYP", 0)] };
+await Post<OperationResult>("api/sessions/close", cashierClose); await Post<OperationResult>("api/sessions/close", cashierClose);
+await Post<OperationResult>("api/sessions/close", new CloseRequest(Guid.NewGuid(), adminShift.RequestId, [new("USD", 0), new("SYP", 150000)]));
+Check((await Get<List<SessionView>>("api/sessions")).Count == 0, "All daily cash sessions closed");
+Check((await Get<DashboardView>("api/dashboard")).CashBase == 15, "Main cash receives 5 USD plus SYP equivalent 10 USD once");
+Check((await Get<List<CustomerView>>("api/customers")).Single(x => x.Id == customer.Id).Balance == -5, "Cash close never changes customer debt");
+var journal = await Get<JsonElement[]>("api/journal");
+Check(journal.Sum(x => x.GetProperty("debit").GetDecimal()) == journal.Sum(x => x.GetProperty("credit").GetDecimal()), "All SQL journal entries balance");
+client.DefaultRequestHeaders.Authorization = new("Bearer", cashier.Token);
+await Bad("api/sales", sale with { RequestId = Guid.NewGuid() }, HttpStatusCode.BadRequest, "Closed cashier session cannot sell");
+var concurrentShift = new OpenSessionRequest(Guid.NewGuid()); await Post<OperationResult>("api/sessions/open", concurrentShift);
+var race1 = sale with { RequestId = Guid.NewGuid(), SessionId = concurrentShift.RequestId, CashPaid = 70, Lines = [new(unit.Id, 7, 10, 0)] };
+var race2 = race1 with { RequestId = Guid.NewGuid() };
+var responses = await Task.WhenAll(client.PostAsJsonAsync("api/sales", race1), client.PostAsJsonAsync("api/sales", race2));
+Check(responses.Count(x => x.IsSuccessStatusCode) == 1, "Concurrent sale requests cannot both spend the same stock");
+foreach (var response in responses) response.Dispose();
+Check((await Get<List<ProductView>>("api/products")).Single().Stock == 2, "Concurrent inventory result remains non-negative and exact");
+client.DefaultRequestHeaders.Authorization = new("Bearer", admin.Token);
+var metadata = new ProductDetails(product.Id, "SUNIX", "iPhone / Samsung", "أسود", "https://example.com/product.jpg", true);
+using (var update = await client.PutAsJsonAsync($"api/products/{product.Id}/details", metadata)) Check(update.IsSuccessStatusCode, "Product metadata and publication saved");
+Check((await Get<ProductDetails>($"api/products/{product.Id}/details")).Brand == "SUNIX", "Product brand and compatibility persist");
+using (var visitor = new HttpClient { BaseAddress = client.BaseAddress })
+{
+    var catalogJson = await visitor.GetStringAsync("api/public/catalog");
+    using var catalogDoc = JsonDocument.Parse(catalogJson);
+    Check(catalogDoc.RootElement.GetProperty("products").GetArrayLength() == 1, "Public catalog includes published materials");
+    Check(!catalogJson.Contains("quantity", StringComparison.OrdinalIgnoreCase) && !catalogJson.Contains("stock", StringComparison.OrdinalIgnoreCase) && !catalogJson.Contains("cost", StringComparison.OrdinalIgnoreCase), "Public catalog contains no quantities or costs");
+    Check((await visitor.GetAsync("mobile")).IsSuccessStatusCode, "Mobile client page available without exposing private data");
+}
+await Post<JsonElement>("api/exchange-rate", new RateInput(16000));
+Check((await Get<RateInput>("api/exchange-rate")).Rate == 16000, "Current exchange rate saved independently");
+Check((await Get<JsonElement>($"api/receipts/{receipt.RequestId}")).GetProperty("rate").GetDecimal() == 15000, "Historical receipt exchange rate unchanged");
+var newWarehouse = await Post<WarehouseView>("api/warehouses", new WarehouseView(Guid.Empty, "مستودع تحويل"));
+var move = new StockMoveRequest(Guid.NewGuid(), warehouse.Id, newWarehouse.Id, unit.Id, 1, "اختبار التحويل");
+await Post<OperationResult>("api/stocks/transfer", move); await Post<OperationResult>("api/stocks/transfer", move);
+Check((await Get<List<ProductView>>("api/products")).Single().Stock == 2, "Transfer retry preserves total inventory");
+Check((await Get<List<StockView>>("api/stocks")).Single(x => x.WarehouseId == newWarehouse.Id).Quantity == 1, "Transfer reaches target once");
+await Bad("api/stocks/transfer", move with { RequestId = Guid.NewGuid(), Quantity = 10 }, HttpStatusCode.BadRequest, "Transfer cannot overspend source");
+var count = new StockCountRequest(Guid.NewGuid(), warehouse.Id, product.Id, 1, 3, "جرد تجريبي");
+await Post<OperationResult>("api/stocks/count", count); await Post<OperationResult>("api/stocks/count", count);
+Check((await Get<List<ProductView>>("api/products")).Single().Stock == 4, "Stock count retry adjusts once");
+await Bad("api/stocks/count", count with { RequestId = Guid.NewGuid(), Counted = 9 }, HttpStatusCode.BadRequest, "Stale stock count is rejected");
+var buyReturn = new PurchaseReturnRequest(Guid.NewGuid(), purchase.RequestId, [new(unit.Id, 1, 0)]);
+await Post<OperationResult>("api/purchases/return", buyReturn); await Post<OperationResult>("api/purchases/return", buyReturn);
+Check((await Get<List<SupplierView>>("api/suppliers")).Single().Balance == 45, "Purchase return reduces supplier balance once");
+Check((await Get<List<ProductView>>("api/products")).Single().Stock == 3, "Purchase return removes exact stock once");
+await Bad("api/purchases/return", buyReturn with { RequestId = Guid.NewGuid(), Lines = [new(unit.Id, 10, 0)] }, HttpStatusCode.BadRequest, "Excess purchase return rejected");
+await Post<JsonElement>("api/prices", new PriceInput(customer.Id, product.Id, 7));
+Check((await Get<PriceInput>($"api/prices/{customer.Id}/{product.Id}")).Price == 7, "Customer-specific price overrides retail price");
+client.DefaultRequestHeaders.Authorization = new("Bearer", cashier.Token);
+await Bad("api/sales", race1 with { RequestId = Guid.NewGuid(), CashPaid = 6, Lines = [new(unit.Id, 1, 6, 0)] }, HttpStatusCode.BadRequest, "Changing unit price cannot bypass discount permission");
+await Post<JsonElement>($"api/drafts/{race1.RequestId}", race1);
+Check((await Get<JsonElement[]>("api/drafts")).Length == 1, "Cashier can save suspended sale");
+Check((await Get<List<ProductView>>("api/products")).Single().Stock == 3, "Suspending a sale never changes inventory");
+client.DefaultRequestHeaders.Authorization = new("Bearer", admin.Token);
+Check((await Get<JsonElement[]>("api/drafts")).Length == 0, "Suspended sales are private to their owner");
+var journalAfter = await Get<JsonElement[]>("api/journal");
+Check(journalAfter.Sum(x => x.GetProperty("debit").GetDecimal()) == journalAfter.Sum(x => x.GetProperty("credit").GetDecimal()), "Transfer count and purchase return keep journal balanced");
+await Bad("api/images", new ImageInput(Convert.ToBase64String(new byte[] { 1, 2, 3, 4 }), "image/png"), HttpStatusCode.BadRequest, "Non-image upload rejected");
+var pictureData = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2lS8AAAAASUVORK5CYII=";
+var uploaded = await Post<ImageView>("api/images", new ImageInput(pictureData, "image/png"));
+using (var visitor = new HttpClient { BaseAddress = client.BaseAddress }) Check((await visitor.GetByteArrayAsync(uploaded.Url)).Length == Convert.FromBase64String(pictureData).Length, "Uploaded product image served without financial data");
+var cardInput = new ProductCardInput(new ProductInput(product.Code, product.Name, "", "", 1, 11, 9), metadata with { ImageUrl = uploaded.Url });
+using (var update = await client.PutAsJsonAsync($"api/products/{product.Id}/card", cardInput)) Check(update.IsSuccessStatusCode, "Product prices and metadata updated atomically");
+using (var update = await client.PutAsJsonAsync($"api/products/{product.Id}/card", cardInput with { Product = cardInput.Product with { RetailPrice = 99 }, Details = cardInput.Details with { ImageUrl = "javascript:alert(1)" } })) Check(update.StatusCode == HttpStatusCode.BadRequest, "Invalid image prevents entire card update");
+Check((await Get<List<ProductView>>("api/products")).Single().RetailPrice == 11, "Rejected product card leaves price unchanged");
+var announcements = await Get<JsonElement[]>("api/announcements?since=2000-01-01T00:00:00Z");
+Check(announcements.Length == 1 && !announcements[0].TryGetProperty("stock", out _), "New-product announcement includes no stock quantity");
+var supplierShift = new OpenSessionRequest(Guid.NewGuid()); await Post<OperationResult>("api/sessions/open", supplierShift);
+await Post<OperationResult>("api/sales", sale with { RequestId = Guid.NewGuid(), SessionId = supplierShift.RequestId, CashPaid = 10, Lines = [new(unit.Id, 1, 10, 0)] });
+var supplierPayment = new SupplierPaymentRequest(Guid.NewGuid(), supplierShift.RequestId, "مورد اختبار", 3, "USD", 16000, "دفعة اختبار مورد");
+await Post<OperationResult>("api/suppliers/pay", supplierPayment); await Post<OperationResult>("api/suppliers/pay", supplierPayment);
+Check((await Get<List<SupplierView>>("api/suppliers")).Single().Balance == 42, "Supplier payment retry reduces debt once");
+await Bad("api/suppliers/pay", supplierPayment with { RequestId = Guid.NewGuid(), Amount = 8 }, HttpStatusCode.BadRequest, "Supplier payment cannot exceed cash in manager box");
+Check((await Get<List<SessionView>>("api/sessions")).Single(x => x.Id == supplierShift.RequestId).Expected.Single(x => x.Currency == "USD").Amount == 7, "Supplier payment reduces exact cash currency once");
+await Post<OperationResult>("api/sessions/close", new CloseRequest(Guid.NewGuid(), supplierShift.RequestId, [new("USD", 7), new("SYP", 0)]));
+Check((await Get<DashboardView>("api/dashboard")).CashBase == 22, "Closing manager box transfers net cash after supplier payment");
+await Bad("api/backups/settings", new { directory = "relative-folder" }, HttpStatusCode.BadRequest, "Backup destination requires absolute server path");
+await Post<JsonElement>("api/backups/settings", new { directory = "" });
+var backup = await Post<JsonElement>("api/backups", new { });
+Check(backup.GetProperty("verified").GetBoolean(), "SQL backup passes checksum verification");
+var selectedBackupFolder = System.IO.Path.GetDirectoryName(backup.GetProperty("file").GetString())!;
+await Post<JsonElement>("api/backups/settings", new { directory = selectedBackupFolder });
+Check((await Get<JsonElement>("api/backups/settings")).GetProperty("directory").GetString() == selectedBackupFolder, "User-chosen backup destination persists");
+var customBackup = await Post<JsonElement>("api/backups", new { });
+Check(System.IO.Path.GetDirectoryName(customBackup.GetProperty("file").GetString()) == selectedBackupFolder, "Backup uses user-selected folder");
+var restored = await Post<JsonElement>("api/backups/restore-test", new { });
+Check(restored.GetProperty("products").GetInt32() == 1 && restored.GetProperty("baseCurrency").GetString() == "USD", "Backup restored into independent database with product and currency intact");
+using (var update = await client.PutAsJsonAsync($"api/users/{cashier.UserId}", new UserUpdate("موظف موقوف", false, [Access.Sale], 0, "اختبار إيقاف الحساب"))) Check(update.IsSuccessStatusCode, "Admin can disable employee with audit reason");
+client.DefaultRequestHeaders.Authorization = new("Bearer", cashier.Token);
+Check((await client.GetAsync("api/products")).StatusCode == HttpStatusCode.Unauthorized, "Disabling employee invalidates existing sessions");
+client.DefaultRequestHeaders.Authorization = new("Bearer", admin.Token);
+Check((await Get<JsonElement[]>("api/audit")).Any(x => x.GetProperty("kind").GetString() == "USER_EDIT"), "Permission changes appear in audit log");
+await Post<JsonElement>("api/products", new ProductInput("RACE", "مادة اختبار ثلاث كاشيرات", "RACE-3", "قطعة", 1, 10, 10));
+var raceProduct = (await Get<List<ProductView>>("api/products")).Single(x => x.Code == "RACE");
+await Post<OperationResult>("api/purchases", new PurchaseRequest(Guid.NewGuid(), warehouse.Id, "مورد اختبار", "USD", 16000, [new(raceProduct.Units.Single().Id, 1, 5)]));
+var cashClients = new List<HttpClient>(); var cashRequests = new List<SaleRequest>();
+for (var i = 0; i < 3; i++)
+{
+    var cashName = "parallel" + i;
+    await Post<JsonElement>("api/users", new UserInput(cashName, "كاشير متزامن " + i, password, false, [Access.Sale], 0));
+    var identity = await Post<LoginResponse>("api/login", new LoginRequest(cashName, password));
+    var cashClient = new HttpClient { BaseAddress = client.BaseAddress }; cashClient.DefaultRequestHeaders.Authorization = new("Bearer", identity.Token);
+    var open = new OpenSessionRequest(Guid.NewGuid()); using var opened = await cashClient.PostAsJsonAsync("api/sessions/open", open); opened.EnsureSuccessStatusCode();
+    cashClients.Add(cashClient); cashRequests.Add(new SaleRequest(Guid.NewGuid(), open.RequestId, warehouse.Id, customer.Id, "USD", 16000, 10, "USD", 16000, null, [new(raceProduct.Units.Single().Id, 1, 10, 0)]));
+}
+var threeResponses = await Task.WhenAll(cashClients.Select((c, i) => c.PostAsJsonAsync("api/sales", cashRequests[i])));
+Check(threeResponses.Count(x => x.IsSuccessStatusCode) == 1, "Three independent cashiers cannot sell the last item twice");
+Check((await Get<List<ProductView>>("api/products")).Single(x => x.Id == raceProduct.Id).Stock == 0, "Three-cashier inventory remains exact");
+foreach (var response in threeResponses) response.Dispose(); foreach (var cashClient in cashClients) cashClient.Dispose();
+Console.WriteLine($"SUCCESS: {passed} checks passed against isolated SQL Server Express database");
